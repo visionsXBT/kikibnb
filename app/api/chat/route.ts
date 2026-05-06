@@ -229,8 +229,11 @@ export async function POST(req: Request) {
     }));
     if (coinSnapshot) {
       modelMessages.push({
-        role: "assistant",
-        content: `[Live market data tool output]\n${coinSnapshot}`,
+        role: "user",
+        content:
+          `[System data context - not a user request]\n` +
+          `Use this live market snapshot when answering the prior user question.\n` +
+          `${coinSnapshot}`,
       });
     }
 
