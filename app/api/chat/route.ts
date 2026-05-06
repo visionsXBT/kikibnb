@@ -7,6 +7,25 @@ export const runtime = "nodejs";
 const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-opus-4-7";
 const MAX_MESSAGES = 48;
 const MAX_CONTENT = 24_000;
+const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
+const COINGECKO_API_BASE =
+  process.env.COINGECKO_API_BASE ??
+  (COINGECKO_API_KEY ? "https://pro-api.coingecko.com/api/v3" : "https://api.coingecko.com/api/v3");
+
+const COIN_ALIASES: Record<string, string> = {
+  btc: "bitcoin",
+  bitcoin: "bitcoin",
+  eth: "ethereum",
+  ethereum: "ethereum",
+  sol: "solana",
+  solana: "solana",
+  bnb: "binancecoin",
+  binancecoin: "binancecoin",
+  doge: "dogecoin",
+  dogecoin: "dogecoin",
+  xrp: "ripple",
+  ripple: "ripple",
+};
 
 type ClientMessage = { role: "user" | "assistant"; content: string };
 
@@ -17,6 +36,71 @@ function isClientMessage(x: unknown): x is ClientMessage {
     (o.role === "user" || o.role === "assistant") &&
     typeof o.content === "string"
   );
+}
+
+function inferCoinIds(text: string): string[] {
+  const lower = text.toLowerCase();
+  const ids = new Set<string>();
+  for (const [alias, id] of Object.entries(COIN_ALIASES)) {
+    const re = new RegExp(`\\b${alias}\\b`, "i");
+    if (re.test(lower)) ids.add(id);
+  }
+  return [...ids];
+}
+
+async function fetchCoinSnapshot(userText: string): Promise<string | null> {
+  const ids = inferCoinIds(userText);
+  if (ids.length === 0) return null;
+
+  const headers: HeadersInit = { accept: "application/json" };
+  if (COINGECKO_API_KEY) {
+    const keyHeader = COINGECKO_API_BASE.includes("pro-api.coingecko.com")
+      ? "x-cg-pro-api-key"
+      : "x-cg-demo-api-key";
+    headers[keyHeader] = COINGECKO_API_KEY;
+  }
+
+  const qs = new URLSearchParams({
+    ids: ids.join(","),
+    vs_currencies: "usd",
+    include_24hr_change: "true",
+    include_last_updated_at: "true",
+  });
+
+  try {
+    const res = await fetch(`${COINGECKO_API_BASE}/simple/price?${qs.toString()}`, {
+      headers,
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const data = (await res.json()) as Record<
+      string,
+      { usd?: number; usd_24h_change?: number; last_updated_at?: number }
+    >;
+
+    const lines = ids
+      .map((id) => {
+        const row = data[id];
+        if (!row || typeof row.usd !== "number") return null;
+        const change =
+          typeof row.usd_24h_change === "number" ? `${row.usd_24h_change.toFixed(2)}%` : "n/a";
+        const updated =
+          typeof row.last_updated_at === "number"
+            ? new Date(row.last_updated_at * 1000).toISOString()
+            : "unknown";
+        return `- ${id}: $${row.usd.toLocaleString("en-US")} (24h: ${change}, updated: ${updated})`;
+      })
+      .filter((x): x is string => Boolean(x));
+
+    if (lines.length === 0) return null;
+    return [
+      "Realtime market snapshot from CoinGecko (USD).",
+      "Use these as current reference prices when relevant:",
+      ...lines,
+    ].join("\n");
+  } catch {
+    return null;
+  }
 }
 
 export async function POST(req: Request) {
@@ -85,12 +169,14 @@ export async function POST(req: Request) {
   }
 
   const anthropic = new Anthropic({ apiKey });
+  const latestUser = [...messages].reverse().find((m) => m.role === "user");
+  const coinSnapshot = latestUser ? await fetchCoinSnapshot(latestUser.content) : null;
 
   try {
     const response = await anthropic.messages.create({
       model: MODEL,
       max_tokens: 8192,
-      system: KIKI_SYSTEM_PROMPT,
+      system: coinSnapshot ? `${KIKI_SYSTEM_PROMPT}\n\n${coinSnapshot}` : KIKI_SYSTEM_PROMPT,
       messages: messages.map((m) => ({
         role: m.role,
         content: m.content,
