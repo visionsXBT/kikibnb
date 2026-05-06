@@ -13,22 +13,8 @@ const COINGECKO_API_BASE =
   process.env.COINGECKO_API_BASE ?? DEFAULT_COINGECKO_BASE;
 const PRO_COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3";
 
-const COIN_ALIASES: Record<string, string> = {
-  btc: "bitcoin",
-  bitcoin: "bitcoin",
-  eth: "ethereum",
-  ethereum: "ethereum",
-  sol: "solana",
-  solana: "solana",
-  bnb: "binancecoin",
-  binancecoin: "binancecoin",
-  doge: "dogecoin",
-  dogecoin: "dogecoin",
-  xrp: "ripple",
-  ripple: "ripple",
-};
-
 type ClientMessage = { role: "user" | "assistant"; content: string };
+type SnapshotRow = { usd?: number; usd_24h_change?: number; last_updated_at?: number };
 
 function isClientMessage(x: unknown): x is ClientMessage {
   if (!x || typeof x !== "object") return false;
@@ -39,41 +25,85 @@ function isClientMessage(x: unknown): x is ClientMessage {
   );
 }
 
-function inferCoinIds(text: string): string[] {
-  const lower = text.toLowerCase();
-  const ids = new Set<string>();
-  for (const [alias, id] of Object.entries(COIN_ALIASES)) {
-    const re = new RegExp(`\\b${alias}\\b`, "i");
-    if (re.test(lower)) ids.add(id);
+function authHeadersForBase(base: string): HeadersInit {
+  const isProBase = base.includes("pro-api.coingecko.com");
+  const headers: HeadersInit = { accept: "application/json" };
+  if (COINGECKO_API_KEY) {
+    headers[isProBase ? "x-cg-pro-api-key" : "x-cg-demo-api-key"] = COINGECKO_API_KEY;
   }
+  return headers;
+}
+
+function maybeAddDemoKey(base: string, qs: URLSearchParams): void {
+  const isProBase = base.includes("pro-api.coingecko.com");
+  if (COINGECKO_API_KEY && !isProBase) {
+    qs.set("x_cg_demo_api_key", COINGECKO_API_KEY);
+  }
+}
+
+function candidateQueriesFromText(text: string): string[] {
+  const lower = text.toLowerCase().trim();
+  const out = new Set<string>();
+  if (lower) out.add(lower);
+
+  for (const m of lower.matchAll(/\$([a-z0-9]{2,20})/g)) {
+    out.add(m[1]);
+  }
+  for (const m of lower.matchAll(/\b[a-z][a-z0-9-]{1,24}\b/g)) {
+    const w = m[0];
+    if (["what", "today", "price", "outlook", "coin", "crypto"].includes(w)) continue;
+    out.add(w);
+  }
+  for (const m of text.matchAll(/[\u3400-\u9FFF]{2,30}/g)) {
+    const chunk = m[0]
+      .replace(/(今日|今天|前景|如何|走势|价格|行情|分析|看法|多少|是什么|预测)/g, "")
+      .trim();
+    if (chunk.length >= 2) out.add(chunk);
+  }
+
+  return [...out].slice(0, 12);
+}
+
+async function resolveCoinIdsForBase(base: string, userText: string): Promise<string[]> {
+  const headers = authHeadersForBase(base);
+  const candidates = candidateQueriesFromText(userText);
+  const ids = new Set<string>();
+
+  for (const query of candidates) {
+    const qs = new URLSearchParams({ query });
+    maybeAddDemoKey(base, qs);
+    const res = await fetch(`${base}/search?${qs.toString()}`, { headers, cache: "no-store" });
+    if (!res.ok) continue;
+    const data = (await res.json()) as {
+      coins?: Array<{ id?: string; market_cap_rank?: number | null }>;
+    };
+    const ranked = [...(data.coins ?? [])]
+      .filter((c): c is { id: string; market_cap_rank?: number | null } => typeof c.id === "string")
+      .sort((a, b) => (a.market_cap_rank ?? 1e9) - (b.market_cap_rank ?? 1e9))
+      .slice(0, 2);
+    for (const c of ranked) ids.add(c.id);
+    if (ids.size >= 4) break;
+  }
+
   return [...ids];
 }
 
 async function fetchCoinSnapshot(userText: string): Promise<string | null> {
-  const ids = inferCoinIds(userText);
-  if (ids.length === 0) return null;
   const bases =
     COINGECKO_API_BASE === DEFAULT_COINGECKO_BASE
       ? [DEFAULT_COINGECKO_BASE, PRO_COINGECKO_BASE]
       : [COINGECKO_API_BASE, DEFAULT_COINGECKO_BASE, PRO_COINGECKO_BASE];
-
-  // Deduplicate while preserving order.
   const uniqueBases = [...new Set(bases)];
-  type SnapshotRow = { usd?: number; usd_24h_change?: number; last_updated_at?: number };
 
-  async function trySimplePrice(base: string): Promise<Record<string, SnapshotRow> | null> {
-    const isProBase = base.includes("pro-api.coingecko.com");
-    const headers: HeadersInit = { accept: "application/json" };
+  async function trySimplePrice(base: string, ids: string[]): Promise<Record<string, SnapshotRow> | null> {
+    const headers = authHeadersForBase(base);
     const qs = new URLSearchParams({
       ids: ids.join(","),
       vs_currencies: "usd",
       include_24hr_change: "true",
       include_last_updated_at: "true",
     });
-    if (COINGECKO_API_KEY) {
-      headers[isProBase ? "x-cg-pro-api-key" : "x-cg-demo-api-key"] = COINGECKO_API_KEY;
-      if (!isProBase) qs.set("x_cg_demo_api_key", COINGECKO_API_KEY);
-    }
+    maybeAddDemoKey(base, qs);
     const res = await fetch(`${base}/simple/price?${qs.toString()}`, {
       headers,
       cache: "no-store",
@@ -82,12 +112,8 @@ async function fetchCoinSnapshot(userText: string): Promise<string | null> {
     return (await res.json()) as Record<string, SnapshotRow>;
   }
 
-  async function tryCoinById(base: string): Promise<Record<string, SnapshotRow> | null> {
-    const isProBase = base.includes("pro-api.coingecko.com");
-    const headers: HeadersInit = { accept: "application/json" };
-    if (COINGECKO_API_KEY) {
-      headers[isProBase ? "x-cg-pro-api-key" : "x-cg-demo-api-key"] = COINGECKO_API_KEY;
-    }
+  async function tryCoinById(base: string, ids: string[]): Promise<Record<string, SnapshotRow> | null> {
+    const headers = authHeadersForBase(base);
     const out: Record<string, SnapshotRow> = {};
     for (const id of ids) {
       const qs = new URLSearchParams({
@@ -98,8 +124,11 @@ async function fetchCoinSnapshot(userText: string): Promise<string | null> {
         developer_data: "false",
         sparkline: "false",
       });
-      if (COINGECKO_API_KEY && !isProBase) qs.set("x_cg_demo_api_key", COINGECKO_API_KEY);
-      const res = await fetch(`${base}/coins/${id}?${qs.toString()}`, { headers, cache: "no-store" });
+      maybeAddDemoKey(base, qs);
+      const res = await fetch(`${base}/coins/${id}?${qs.toString()}`, {
+        headers,
+        cache: "no-store",
+      });
       if (!res.ok) continue;
       const data = (await res.json()) as {
         market_data?: { current_price?: { usd?: number }; price_change_percentage_24h?: number };
@@ -119,8 +148,10 @@ async function fetchCoinSnapshot(userText: string): Promise<string | null> {
 
   for (const base of uniqueBases) {
     try {
-      const fromSimple = await trySimplePrice(base);
-      const fromCoinById = fromSimple ? null : await tryCoinById(base);
+      const ids = await resolveCoinIdsForBase(base, userText);
+      if (!ids.length) continue;
+      const fromSimple = await trySimplePrice(base, ids);
+      const fromCoinById = fromSimple ? null : await tryCoinById(base, ids);
       const data = fromSimple ?? fromCoinById;
       if (!data) continue;
 
