@@ -44,7 +44,8 @@ function maybeAddDemoKey(base: string, qs: URLSearchParams): void {
 function candidateQueriesFromText(text: string): string[] {
   const lower = text.toLowerCase().trim();
   const out = new Set<string>();
-  if (lower) out.add(lower);
+  const hasCjkText = /[\u3400-\u9FFF]/.test(text);
+  if (lower && !hasCjkText) out.add(lower);
 
   for (const m of lower.matchAll(/\$([a-z0-9]{2,20})/g)) {
     out.add(m[1]);
@@ -62,6 +63,14 @@ function candidateQueriesFromText(text: string): string[] {
   }
 
   return [...out].slice(0, 12);
+}
+
+function isLikelyCoinPriceQuery(text: string): boolean {
+  const lower = text.toLowerCase();
+  const hasCoinCue =
+    /\b(price|outlook|btc|eth|sol|bnb|xrp|aave|token|coin|crypto)\b/.test(lower) ||
+    /比特币|以太坊|币安币|狗狗币|瑞波|代币|币价|行情|走势|前景/.test(text);
+  return hasCoinCue;
 }
 
 async function resolveCoinIdsForBase(base: string, userText: string): Promise<string[]> {
@@ -252,6 +261,17 @@ export async function POST(req: Request) {
   const anthropic = new Anthropic({ apiKey });
   const latestUser = [...messages].reverse().find((m) => m.role === "user");
   const coinSnapshot = latestUser ? await fetchCoinSnapshot(latestUser.content) : null;
+  const needsLiveCoinData = latestUser ? isLikelyCoinPriceQuery(latestUser.content) : false;
+
+  if (needsLiveCoinData && !coinSnapshot) {
+    return NextResponse.json(
+      {
+        error:
+          "Live coin data lookup failed for this query right now. Please retry with coin ticker/name (e.g. BTC, AAVE, Bitcoin, 比特币).",
+      },
+      { status: 503 },
+    );
+  }
 
   try {
     const modelMessages = messages.map((m) => ({
