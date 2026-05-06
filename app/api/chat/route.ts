@@ -15,6 +15,7 @@ const PRO_COINGECKO_BASE = "https://pro-api.coingecko.com/api/v3";
 
 type ClientMessage = { role: "user" | "assistant"; content: string };
 type SnapshotRow = { usd?: number; usd_24h_change?: number; last_updated_at?: number };
+const LOOKUP_MODEL = process.env.ANTHROPIC_LOOKUP_MODEL ?? MODEL;
 
 function isClientMessage(x: unknown): x is ClientMessage {
   if (!x || typeof x !== "object") return false;
@@ -41,11 +42,15 @@ function maybeAddDemoKey(base: string, qs: URLSearchParams): void {
   }
 }
 
-function candidateQueriesFromText(text: string): string[] {
+function candidateQueriesFromText(text: string, translatedHints: string[] = []): string[] {
   const lower = text.toLowerCase().trim();
   const out = new Set<string>();
   const hasCjkText = /[\u3400-\u9FFF]/.test(text);
   if (lower && !hasCjkText) out.add(lower);
+  for (const hint of translatedHints) {
+    const h = hint.toLowerCase().trim();
+    if (h) out.add(h);
+  }
 
   for (const m of lower.matchAll(/\$([a-z0-9]{2,20})/g)) {
     out.add(m[1]);
@@ -73,9 +78,13 @@ function isLikelyCoinPriceQuery(text: string): boolean {
   return hasCoinCue;
 }
 
-async function resolveCoinIdsForBase(base: string, userText: string): Promise<string[]> {
+async function resolveCoinIdsForBase(
+  base: string,
+  userText: string,
+  translatedHints: string[],
+): Promise<string[]> {
   const headers = authHeadersForBase(base);
-  const candidates = candidateQueriesFromText(userText);
+  const candidates = candidateQueriesFromText(userText, translatedHints);
   const ids = new Set<string>();
 
   for (const query of candidates) {
@@ -97,7 +106,44 @@ async function resolveCoinIdsForBase(base: string, userText: string): Promise<st
   return [...ids];
 }
 
-async function fetchCoinSnapshot(userText: string): Promise<string | null> {
+async function fetchTranslatedCoinHints(
+  anthropic: Anthropic,
+  userText: string,
+): Promise<string[]> {
+  if (!/[\u3400-\u9FFF]/.test(userText)) return [];
+  try {
+    const prompt = [
+      "Extract likely cryptocurrency coin names/tickers from this user query.",
+      "Return ONLY a JSON array of lowercase strings, max 6 items.",
+      "Use english coin names or tickers when possible.",
+      "If no coin reference, return []",
+      `Query: ${userText}`,
+    ].join("\n");
+    const r = await anthropic.messages.create({
+      model: LOOKUP_MODEL,
+      max_tokens: 120,
+      messages: [{ role: "user", content: prompt }],
+    });
+    const text = r.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("\n")
+      .trim();
+    const match = text.match(/\[[\s\S]*\]/);
+    if (!match) return [];
+    const arr = JSON.parse(match[0]) as unknown;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter((x): x is string => typeof x === "string")
+      .map((s) => s.toLowerCase().trim())
+      .filter(Boolean)
+      .slice(0, 6);
+  } catch {
+    return [];
+  }
+}
+
+async function fetchCoinSnapshot(userText: string, translatedHints: string[]): Promise<string | null> {
   const bases =
     COINGECKO_API_BASE === DEFAULT_COINGECKO_BASE
       ? [DEFAULT_COINGECKO_BASE, PRO_COINGECKO_BASE]
@@ -157,7 +203,7 @@ async function fetchCoinSnapshot(userText: string): Promise<string | null> {
 
   for (const base of uniqueBases) {
     try {
-      const ids = await resolveCoinIdsForBase(base, userText);
+      const ids = await resolveCoinIdsForBase(base, userText, translatedHints);
       if (!ids.length) continue;
       const fromSimple = await trySimplePrice(base, ids);
       const fromCoinById = fromSimple ? null : await tryCoinById(base, ids);
@@ -260,7 +306,12 @@ export async function POST(req: Request) {
 
   const anthropic = new Anthropic({ apiKey });
   const latestUser = [...messages].reverse().find((m) => m.role === "user");
-  const coinSnapshot = latestUser ? await fetchCoinSnapshot(latestUser.content) : null;
+  const translatedHints = latestUser
+    ? await fetchTranslatedCoinHints(anthropic, latestUser.content)
+    : [];
+  const coinSnapshot = latestUser
+    ? await fetchCoinSnapshot(latestUser.content, translatedHints)
+    : null;
   const needsLiveCoinData = latestUser ? isLikelyCoinPriceQuery(latestUser.content) : false;
 
   if (needsLiveCoinData && !coinSnapshot) {
